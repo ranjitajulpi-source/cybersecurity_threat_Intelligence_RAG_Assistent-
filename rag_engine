@@ -1,0 +1,106 @@
+"""
+rag_engine.py
+Minimal retrieval-augmented pipeline for analyst-uploaded reports:
+
+    upload -> extract text (PyMuPDF) -> chunk -> embed (sentence-transformers)
+    -> index (FAISS) -> retrieve top-k -> answer (Groq)
+
+The index lives in st.session_state so it's scoped to one analyst's
+session rather than shared globally.
+"""
+
+import os
+import re
+
+import fitz  # PyMuPDF
+import numpy as np
+import faiss
+import streamlit as st
+from groq import Groq
+from sentence_transformers import SentenceTransformer
+
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+# Verify current model availability/names at console.groq.com before deploying.
+GROQ_MODEL = "llama-3.3-70b-versatile"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
+
+
+@st.cache_resource(show_spinner=False)
+def get_embedder() -> SentenceTransformer:
+    return SentenceTransformer(EMBED_MODEL_NAME)
+
+
+def extract_text(file) -> str:
+    """Extract raw text from an uploaded PDF (Streamlit UploadedFile)."""
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    pages = [page.get_text() for page in doc]
+    doc.close()
+    return "\n".join(pages)
+
+
+def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        chunks.append(text[start:end])
+        start = end - overlap
+    return [c for c in chunks if c.strip()]
+
+
+def build_index(chunks: list[str]):
+    """Embed chunks and build a FAISS flat-L2 index. Returns (index, embeddings)."""
+    embedder = get_embedder()
+    embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+    embeddings = np.asarray(embeddings, dtype="float32")
+    index = faiss.IndexFlatIP(embeddings.shape[1])  # inner product == cosine on normalized vecs
+    index.add(embeddings)
+    return index
+
+
+def retrieve(query: str, chunks: list[str], index, top_k: int = 4) -> list[str]:
+    if index is None or not chunks:
+        return []
+    embedder = get_embedder()
+    q_vec = embedder.encode([query], normalize_embeddings=True).astype("float32")
+    scores, idxs = index.search(q_vec, min(top_k, len(chunks)))
+    return [chunks[i] for i in idxs[0] if i != -1]
+
+
+def ask_groq(question: str, context_chunks: list[str], mode: str = "technical") -> str:
+    """
+    Answer a question grounded only in the retrieved context. Explicitly
+    instructed to say when the context doesn't contain the answer, rather
+    than fill the gap from general knowledge.
+    """
+    api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        return "GROQ_API_KEY is not set. Add it to your environment or Streamlit secrets."
+
+    client = Groq(api_key=api_key)
+    context = "\n\n---\n\n".join(context_chunks) if context_chunks else "(no matching context found)"
+
+    tone_instruction = (
+        "Explain in plain, jargon-free language suitable for a non-technical reader."
+        if mode == "beginner"
+        else "Use precise technical security terminology (attack vectors, CWE/CVSS, mitigations)."
+    )
+
+    system_prompt = (
+        "You are a security analyst assistant. Answer ONLY using the provided "
+        "report context. If the context does not contain the answer, say so "
+        "explicitly instead of guessing. " + tone_instruction
+    )
+
+    completion = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+        ],
+        temperature=0.2,
+        max_tokens=800,
+    )
+    return completion.choices[0].message.content
