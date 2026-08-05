@@ -1,0 +1,129 @@
+"""
+threat_intel.py
+Live threat intelligence lookups against public, no-auth-required sources:
+- NVD (National Vulnerability Database) for CVE details
+- CISA KEV (Known Exploited Vulnerabilities) catalog
+- FIRST.org EPSS (Exploit Prediction Scoring System)
+
+All calls are cached via st.cache_data so repeat lookups in a session
+don't re-hit rate-limited upstreams. Fields are never invented: if NVD
+doesn't return a value, the field comes back as None and the UI should
+say "not available" rather than guess.
+"""
+
+import requests
+import streamlit as st
+
+NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+FIRST_EPSS_URL = "https://api.first.org/data/v1/epss"
+
+REQUEST_TIMEOUT = 12
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cve(cve_id: str) -> dict | None:
+    """Fetch a single CVE's details from NVD. Returns None if not found."""
+    cve_id = cve_id.strip().upper()
+    try:
+        resp = requests.get(
+            NVD_CVE_URL, params={"cveId": cve_id}, timeout=REQUEST_TIMEOUT
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    vulns = data.get("vulnerabilities", [])
+    if not vulns:
+        return None
+
+    cve = vulns[0]["cve"]
+
+    descriptions = cve.get("descriptions", [])
+    description = next(
+        (d["value"] for d in descriptions if d.get("lang") == "en"), None
+    )
+
+    metrics = cve.get("metrics", {})
+    cvss_score, cvss_vector, severity = None, None, None
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        if key in metrics and metrics[key]:
+            m = metrics[key][0]
+            cvss_data = m.get("cvssData", {})
+            cvss_score = cvss_data.get("baseScore")
+            cvss_vector = cvss_data.get("vectorString")
+            severity = m.get("baseSeverity") or cvss_data.get("baseSeverity")
+            break
+
+    weaknesses = cve.get("weaknesses", [])
+    cwe_ids = []
+    for w in weaknesses:
+        for d in w.get("description", []):
+            if d.get("value", "").startswith("CWE-"):
+                cwe_ids.append(d["value"])
+
+    configurations = cve.get("configurations", [])
+    cpe_matches = []
+    for config in configurations:
+        for node in config.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+                if match.get("vulnerable"):
+                    cpe_matches.append(match.get("criteria"))
+
+    references = [r.get("url") for r in cve.get("references", []) if r.get("url")]
+
+    return {
+        "id": cve.get("id"),
+        "description": description,
+        "published": cve.get("published"),
+        "last_modified": cve.get("lastModified"),
+        "cvss_score": cvss_score,
+        "cvss_vector": cvss_vector,
+        "severity": severity,
+        "cwe_ids": cwe_ids or None,
+        "affected_products": cpe_matches[:10] or None,
+        "references": references[:10] or None,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_kev_catalog() -> dict:
+    """Fetch the full CISA KEV catalog, indexed by CVE ID for fast lookup."""
+    try:
+        resp = requests.get(CISA_KEV_URL, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return {}
+
+    return {
+        entry["cveID"]: entry
+        for entry in data.get("vulnerabilities", [])
+        if "cveID" in entry
+    }
+
+
+def is_in_kev(cve_id: str, kev_catalog: dict) -> dict | None:
+    return kev_catalog.get(cve_id.strip().upper())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_epss(cve_id: str) -> float | None:
+    """Fetch EPSS exploitation-probability score (0-1) for a CVE."""
+    try:
+        resp = requests.get(
+            FIRST_EPSS_URL, params={"cve": cve_id.strip().upper()}, timeout=REQUEST_TIMEOUT
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    results = data.get("data", [])
+    if not results:
+        return None
+    try:
+        return float(results[0]["epss"])
+    except (KeyError, ValueError, TypeError):
+        return None
