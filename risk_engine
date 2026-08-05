@@ -1,0 +1,88 @@
+"""
+risk_engine.py
+Turns raw vulnerability signals (CVSS, EPSS, exploitation status, patch
+availability) into a single 0-100 risk score with a human-readable
+explanation. Kept deterministic and dependency-free so it's easy to audit.
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RiskResult:
+    score: int
+    priority: str          # "Critical" | "High" | "Medium" | "Low"
+    color: str              # hex color for the priority
+    reasons: list = field(default_factory=list)
+
+
+PRIORITY_BANDS = [
+    (80, "Critical", "#FF4757"),
+    (60, "High", "#FF8C42"),
+    (40, "Medium", "#FFB020"),
+    (0, "Low", "#2ED573"),
+]
+
+
+def _priority_for(score: int):
+    for threshold, label, color in PRIORITY_BANDS:
+        if score >= threshold:
+            return label, color
+    return "Low", "#2ED573"
+
+
+def compute_risk_score(
+    cvss: float | None,
+    epss: float | None = None,
+    is_kev: bool = False,
+    public_exploit: bool = False,
+    patch_available: bool = True,
+    asset_criticality: str = "medium",
+) -> RiskResult:
+    """
+    Weighted blend of severity (CVSS), real-world exploitation likelihood
+    (EPSS), confirmed active exploitation (CISA KEV), and mitigating/
+    aggravating factors. All inputs are optional except cvss; missing
+    signals are simply excluded from the blend rather than guessed at.
+    """
+    reasons = []
+    weighted_sum = 0.0
+    weight_total = 0.0
+
+    if cvss is not None:
+        cvss_component = (cvss / 10.0) * 100
+        weighted_sum += cvss_component * 0.45
+        weight_total += 0.45
+        reasons.append(f"Base severity CVSS {cvss:.1f}/10")
+
+    if epss is not None:
+        epss_component = epss * 100
+        weighted_sum += epss_component * 0.25
+        weight_total += 0.25
+        reasons.append(f"EPSS exploitation probability {epss * 100:.1f}%")
+
+    exploitation_component = 0
+    if is_kev:
+        exploitation_component = 100
+        reasons.append("Listed in CISA Known Exploited Vulnerabilities catalog")
+    elif public_exploit:
+        exploitation_component = 70
+        reasons.append("Public exploit code available")
+    weighted_sum += exploitation_component * 0.20
+    weight_total += 0.20
+
+    criticality_map = {"low": 20, "medium": 55, "high": 85, "critical": 100}
+    crit_component = criticality_map.get(asset_criticality.lower(), 55)
+    weighted_sum += crit_component * 0.10
+    weight_total += 0.10
+    reasons.append(f"Asset criticality: {asset_criticality.title()}")
+
+    raw_score = weighted_sum / weight_total if weight_total else 0
+    if not patch_available:
+        raw_score = min(100, raw_score * 1.1)
+        reasons.append("No patch currently available (score boosted)")
+
+    score = max(0, min(100, round(raw_score)))
+    priority, color = _priority_for(score)
+
+    return RiskResult(score=score, priority=priority, color=color, reasons=reasons)
