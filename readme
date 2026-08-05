@@ -1,0 +1,65 @@
+# SOC Sentinel
+
+A Streamlit console for CVE investigation, report triage, and risk scoring.
+
+- **CVE Lookup** — live data from NVD, CISA KEV, and FIRST EPSS, with a
+  computed risk score and gauge.
+- **Report Analysis** — upload a PDF, ask questions about it; answers are
+  grounded only in the uploaded document (FAISS retrieval + Groq).
+- **Dashboard** — session-level summary of investigations run so far.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+export GROQ_API_KEY="your-key-here"      # get one at console.groq.com
+streamlit run app.py
+```
+
+Open the URL Streamlit prints (usually `http://localhost:8501`).
+
+## Deploy on Streamlit Community Cloud
+
+1. Push this folder to a GitHub repo (`app.py` at the repo root, or set the
+   correct "Main file path" in the deploy dialog if it's in a subfolder).
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app** →
+   pick the repo/branch → set main file to `app.py`.
+3. Before deploying, open **Advanced settings → Secrets** and paste:
+   ```toml
+   GROQ_API_KEY = "your-groq-api-key-here"
+   ```
+4. Deploy. First boot will be slower than usual — it downloads the
+   `all-MiniLM-L6-v2` sentence-transformers model (~90MB) on first use.
+
+## Notes / things to check before relying on this in production
+
+- **Model name**: `GROQ_MODEL` in `rag_engine.py` is set to
+  `llama-3.3-70b-versatile`. Groq's available models change — check
+  `console.groq.com` and update the constant if the call fails with a
+  "model not found" error.
+- **NVD rate limits**: unauthenticated NVD API calls are limited to a
+  handful of requests per 30 seconds. Results are cached for 1 hour
+  (`st.cache_data(ttl=3600)`) to stay well under that, but heavy concurrent
+  use will still hit limits — get an NVD API key and add it to the request
+  headers in `threat_intel.py` if you need higher throughput.
+- **Session-only state**: investigation history and the uploaded report
+  index live in `st.session_state`, so they reset on page reload and
+  aren't shared between users. Add a database (e.g. SQLite, Postgres) if
+  you need persistence across sessions — this wasn't in scope here.
+- **This is a working core, not the full 13-feature brief** from the
+  original scoping doc. It covers CVE Lookup, Report Analysis (chat), risk
+  scoring, and a basic Dashboard. Comparison mode, investigation report
+  export (PDF/DOCX), and full observability/security hardening (Phases
+  7, 10–12 in the scope doc) aren't built yet.
+
+## File structure
+
+```
+soc-sentinel/
+├── app.py                          # Streamlit UI, theme, layout
+├── risk_engine.py                  # 0-100 risk scoring
+├── threat_intel.py                 # NVD / CISA KEV / EPSS API clients
+├── rag_engine.py                   # PDF extraction, FAISS, Groq Q&A
+├── requirements.txt
+└── .streamlit/secrets.toml.example
+```
