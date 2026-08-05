@@ -414,4 +414,371 @@ status_html = '<span class="status-chip status-online">● Armed</span>' if clie
 st.markdown(
     f"""
     <div class="console-header">
-        <
+        <div class="pulse-wrap"><div class="pulse-ring"></div><div class="pulse-ring delay"></div><div class="pulse-dot"></div></div>
+        <div>
+            <p class="console-title">SIGNAL <span class="role-chip">{st.session_state.role}</span></p>
+            <p class="console-sub">Threat Intelligence Console · live feeds + RAG analysis</p>
+        </div>
+        {status_html}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Ingest actions
+# ---------------------------------------------------------------------------
+if uploaded_files:
+    for f in uploaded_files:
+        if f.name not in st.session_state.sources:
+            with st.spinner(f"Parsing {f.name}..."):
+                n = add_to_index(extract_pdf_text(f.read()), f.name)
+            st.sidebar.success(f"+{n} chunks — {f.name}")
+
+if fetch_cve_btn:
+    if not cve_id_input.strip():
+        st.sidebar.error("Enter a CVE ID first.")
+    else:
+        with st.spinner("Querying NVD..."):
+            try:
+                rec = nvd_get_single(cve_id_input)
+            except Exception as e:
+                rec = None
+                st.sidebar.error(f"NVD lookup failed: {e}")
+        if rec:
+            text = f"CVE ID: {rec['id']}\nCVSS: {rec['cvss']} ({rec['severity']})\nDescription: {rec['description']}\nCWEs: {', '.join(rec['cwes'])}"
+            n = add_to_index(text, rec["id"])
+            st.session_state.bookmarks.setdefault(rec["id"], rec)
+            st.sidebar.markdown(f'<div class="kb-readout">+{n} chunks — <b>{rec["id"]}</b> {severity_chip_html(rec["severity"])}</div>', unsafe_allow_html=True)
+        elif rec is None:
+            st.sidebar.warning("No data found for that CVE ID.")
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_dash, tab_feed, tab_chat, tab_search, tab_attack, tab_graph, tab_reports = st.tabs(
+    ["📊 Dashboard", "📡 Threat Feed", "🤖 AI Chat", "🔍 Search & Compare", "🗺️ ATT&CK Map", "🕸️ Knowledge Graph", "📁 Reports"]
+)
+
+# ---- DASHBOARD -------------------------------------------------------------
+with tab_dash:
+    st.markdown('<p class="section-label">// System Overview</p>', unsafe_allow_html=True)
+    try:
+        kev = fetch_kev(80)
+    except Exception as e:
+        kev = []
+        st.warning(f"CISA KEV feed unavailable right now ({e}).")
+    try:
+        recent = nvd_search(days_back=30, results=50)
+    except Exception as e:
+        recent = []
+        st.warning(f"NVD feed unavailable right now ({e}).")
+
+    recent_kev_alerts = [v for v in kev if v.get("dateAdded", "") >= (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")]
+    if recent_kev_alerts:
+        st.markdown(
+            f'<div class="alert-banner">🚨 <b>{len(recent_kev_alerts)}</b> new actively-exploited vulnerabilities added to CISA KEV in the last 7 days</div>',
+            unsafe_allow_html=True,
+        )
+
+    sev_counts = pd.Series([c["severity"] for c in recent]).value_counts() if recent else pd.Series(dtype=int)
+    ransomware_count = sum(1 for v in kev if v.get("knownRansomwareCampaignUse", "") == "Known")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("KEV entries tracked", len(kev))
+    c2.metric("Linked to ransomware", ransomware_count)
+    c3.metric("Critical (30d, NVD)", int(sev_counts.get("CRITICAL", 0)))
+    c4.metric("Indexed KB chunks", len(st.session_state.chunks))
+
+    col1, col2 = st.columns([1, 1.3])
+    with col1:
+        if not sev_counts.empty:
+            fig = px.pie(
+                names=sev_counts.index, values=sev_counts.values, hole=0.55,
+                color=sev_counts.index, color_discrete_map=SEVERITY_COLORS, template=PLOTLY_TEMPLATE,
+                title="Severity distribution — CVEs published, last 30 days",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No recent NVD data to chart.")
+    with col2:
+        if kev:
+            vendor_counts = pd.Series([v.get("vendorProject", "Unknown") for v in kev]).value_counts().head(10)
+            fig = px.bar(
+                x=vendor_counts.values, y=vendor_counts.index, orientation="h",
+                template=PLOTLY_TEMPLATE, title="Top vendors — CISA Known Exploited Vulnerabilities",
+                labels={"x": "KEV entries", "y": ""},
+            )
+            fig.update_traces(marker_color="#2FE2D0")
+            st.plotly_chart(fig, use_container_width=True)
+
+    if kev:
+        kev_df = pd.DataFrame(kev)
+        kev_df["dateAdded"] = pd.to_datetime(kev_df["dateAdded"])
+        daily = kev_df.groupby(kev_df["dateAdded"].dt.date).size().reset_index(name="count")
+        fig = px.line(daily, x="dateAdded", y="count", template=PLOTLY_TEMPLATE, title="KEV additions over time (trend)")
+        fig.update_traces(line_color="#2FE2D0")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if recent:
+        heat_df = pd.DataFrame(recent)
+        heat_df["published"] = pd.to_datetime(heat_df["published"], errors="coerce")
+        heat_df["week"] = heat_df["published"].dt.strftime("W%U")
+        pivot = heat_df.pivot_table(index="severity", columns="week", values="id", aggfunc="count", fill_value=0)
+        if not pivot.empty:
+            fig = px.imshow(pivot, template=PLOTLY_TEMPLATE, aspect="auto", color_continuous_scale="Tealgrn", title="Severity heatmap by week (30d)")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown('<p class="section-label">// Recent CVEs</p>', unsafe_allow_html=True)
+    if recent:
+        for rec in recent[:8]:
+            st.markdown(
+                f"**{rec['id']}** {severity_chip_html(rec['severity'])} · CVSS {rec['cvss'] or 'N/A'} · {rec['published']}  \n"
+                f"{rec['description'][:220]}{'...' if len(rec['description']) > 220 else ''}",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("No recent CVE data available.")
+
+# ---- THREAT FEED ------------------------------------------------------------
+with tab_feed:
+    st.markdown('<p class="section-label">// Live Feed — CISA Known Exploited Vulnerabilities</p>', unsafe_allow_html=True)
+    try:
+        kev = fetch_kev(60)
+    except Exception as e:
+        kev = []
+        st.error(f"Feed unavailable: {e}")
+    if kev:
+        df = pd.DataFrame(kev)[["cveID", "vendorProject", "product", "vulnerabilityName", "dateAdded", "dueDate", "knownRansomwareCampaignUse"]]
+        df.columns = ["CVE", "Vendor", "Product", "Name", "Added", "Patch due", "Ransomware use"]
+        st.dataframe(df, use_container_width=True, height=420)
+        st.caption("Source: CISA Known Exploited Vulnerabilities catalog (cisa.gov)")
+
+    st.markdown('<p class="section-label">// Live Feed — NVD Recent Publications</p>', unsafe_allow_html=True)
+    kw = st.text_input("Filter recent NVD feed by keyword (optional)", key="feed_kw")
+    try:
+        feed_recent = nvd_search(keyword=kw, days_back=14, results=30)
+    except Exception as e:
+        feed_recent = []
+        st.error(f"NVD feed unavailable: {e}")
+    for rec in feed_recent[:15]:
+        st.markdown(
+            f"**[{rec['id']}](https://nvd.nist.gov/vuln/detail/{rec['id']})** {severity_chip_html(rec['severity'])} · {rec['published']}  \n"
+            f"{rec['description'][:200]}{'...' if len(rec['description']) > 200 else ''}",
+            unsafe_allow_html=True,
+        )
+
+# ---- AI CHAT ------------------------------------------------------------
+with tab_chat:
+    st.markdown('<p class="section-label">// Query Log — AI Analyst Chat</p>', unsafe_allow_html=True)
+    if st.session_state.chunks:
+        st.markdown(
+            f'<div class="kb-readout">📡 <b>{len(st.session_state.chunks)}</b> chunks indexed from '
+            f'<b>{len(set(st.session_state.sources))}</b> source(s)</div>', unsafe_allow_html=True,
+        )
+    else:
+        st.markdown('<div class="kb-readout">📡 Knowledge base empty — add a PDF or CVE from the control panel</div>', unsafe_allow_html=True)
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(f'<div class="log-time">{msg.get("time", "")}</div>', unsafe_allow_html=True)
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("confidence") is not None:
+                pct, label, color = msg["confidence"]
+                st.markdown(f'<span class="conf-chip" style="color:{color};border-color:{color};">Confidence: {label} ({pct}%)</span>', unsafe_allow_html=True)
+
+    query = st.chat_input("e.g. Is CVE-2024-3400 being actively exploited, and what's the mitigation?")
+    if query:
+        if not client:
+            st.error("Enter a Groq API key in the control panel first.")
+        elif not st.session_state.chunks:
+            st.error("Add at least one document or CVE before asking a question.")
+        else:
+            now = timestamp()
+            st.session_state.messages.append({"role": "user", "content": query, "time": now})
+            with st.chat_message("user"):
+                st.markdown(f'<div class="log-time">{now}</div>', unsafe_allow_html=True)
+                st.markdown(query)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Scanning knowledge base..."):
+                    results = retrieve(query)
+                    answer = answer_question(client, query, results)
+                    avg_score = float(np.mean([s for _, _, s in results])) if results else 0.0
+                    pct, label, color = confidence_label(avg_score)
+                    now2 = timestamp()
+                    st.markdown(f'<div class="log-time">{now2}</div>', unsafe_allow_html=True)
+                    st.markdown(answer)
+                    st.markdown(f'<span class="conf-chip" style="color:{color};border-color:{color};">Confidence: {label} ({pct}%)</span>', unsafe_allow_html=True)
+                    with st.expander("🔎 Explainability — why this answer"):
+                        st.caption("Retrieved chunks ranked by cosine similarity to your question. The model was instructed to answer only from these.")
+                        for chunk, src, score in results:
+                            st.markdown(f"**{src}** · similarity `{score:.2f}`")
+                            st.caption(chunk[:280] + ("..." if len(chunk) > 280 else ""))
+            st.session_state.messages.append({"role": "assistant", "content": answer, "time": now2, "confidence": (pct, label, color)})
+
+# ---- SEARCH & COMPARE ------------------------------------------------------------
+with tab_search:
+    st.markdown('<p class="section-label">// Advanced Search</p>', unsafe_allow_html=True)
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    kw = sc1.text_input("Keyword / vendor / product")
+    sev_filter = sc2.selectbox("Severity", ["Any", "CRITICAL", "HIGH", "MEDIUM", "LOW"])
+    days = sc3.slider("Published within (days)", 0, 365, 90)
+    n_results = sc4.slider("Max results", 5, 50, 20)
+
+    if st.button("Run search"):
+        with st.spinner("Querying NVD..."):
+            try:
+                st.session_state.search_results = nvd_search(keyword=kw, severity=sev_filter, days_back=days, results=n_results)
+            except Exception as e:
+                st.session_state.search_results = []
+                st.error(f"Search failed: {e}")
+
+    results = st.session_state.search_results
+    if results:
+        df = pd.DataFrame(results)[["id", "severity", "cvss", "published", "description"]]
+        df.columns = ["CVE", "Severity", "CVSS", "Published", "Description"]
+        st.dataframe(df, use_container_width=True, height=320)
+
+        ids = [r["id"] for r in results]
+        chosen = st.multiselect("Select CVEs to bookmark or compare", ids)
+        bc1, bc2 = st.columns(2)
+        if bc1.button("⭐ Bookmark selected"):
+            for r in results:
+                if r["id"] in chosen:
+                    st.session_state.bookmarks[r["id"]] = r
+            st.success(f"Bookmarked {len(chosen)} CVE(s).")
+        if bc2.button("⚖️ Add to comparison"):
+            st.session_state.compare_ids = list(set(st.session_state.compare_ids + chosen))
+            st.success(f"Comparison set: {', '.join(st.session_state.compare_ids)}")
+    else:
+        st.info("Run a search to see results here.")
+
+    st.markdown('<p class="section-label">// CVE Comparison</p>', unsafe_allow_html=True)
+    if st.session_state.compare_ids:
+        pool = {r["id"]: r for r in results}
+        pool.update(st.session_state.bookmarks)
+        rows = [pool[i] for i in st.session_state.compare_ids if i in pool]
+        if rows:
+            comp_df = pd.DataFrame(rows)[["id", "severity", "cvss", "published", "cwes", "vendors", "description"]]
+            comp_df.columns = ["CVE", "Severity", "CVSS", "Published", "CWE(s)", "Vendors", "Description"]
+            st.dataframe(comp_df, use_container_width=True)
+        if st.button("Clear comparison set"):
+            st.session_state.compare_ids = []
+    else:
+        st.caption("Select CVEs above and click \"Add to comparison\" to compare them side by side.")
+
+# ---- ATT&CK MAP ------------------------------------------------------------
+with tab_attack:
+    st.markdown('<p class="section-label">// MITRE ATT&CK Mapping (illustrative)</p>', unsafe_allow_html=True)
+    st.caption("Mapped from each CVE's CWE weakness type to a small illustrative CWE→technique lookup table — not the full official MITRE dataset.")
+    pool = {**st.session_state.bookmarks, **{r["id"]: r for r in st.session_state.search_results}}
+    if not pool:
+        st.info("Bookmark or search a CVE first to see its ATT&CK mapping.")
+    else:
+        pick = st.selectbox("CVE", list(pool.keys()))
+        rec = pool[pick]
+        st.markdown(f"**{rec['id']}** {severity_chip_html(rec['severity'])} · CVSS {rec['cvss'] or 'N/A'}", unsafe_allow_html=True)
+        st.write(rec["description"])
+        rows = []
+        for cwe in rec["cwes"]:
+            techniques = CWE_ATTACK_MAP.get(cwe, DEFAULT_ATTACK if cwe != "N/A" else [])
+            for tid, tname in techniques:
+                rows.append({"CWE": cwe, "ATT&CK Technique": f"{tid} — {tname}"})
+        if rows:
+            st.table(pd.DataFrame(rows))
+        else:
+            st.info("No CWE data available on this CVE to map.")
+
+# ---- KNOWLEDGE GRAPH ------------------------------------------------------------
+with tab_graph:
+    st.markdown('<p class="section-label">// Interactive Knowledge Graph</p>', unsafe_allow_html=True)
+    st.caption("CVE ↔ Vendor/Product ↔ CWE relationships, built from NVD data for your bookmarked/searched CVEs. "
+               "Malware/threat-actor nodes need a registered threat-intel feed (e.g. OTX, MISP) — not connected here.")
+    pool = {**st.session_state.bookmarks, **{r["id"]: r for r in st.session_state.search_results}}
+    if not pool:
+        st.info("Bookmark or search CVEs to build the graph.")
+    else:
+        nodes, edges = {}, []
+        for rec in pool.values():
+            nodes[rec["id"]] = "cve"
+            for v in rec.get("vendors", []):
+                nodes[v] = "vendor"
+                edges.append((rec["id"], v))
+            for cwe in rec.get("cwes", []):
+                if cwe != "N/A":
+                    nodes[cwe] = "cwe"
+                    edges.append((rec["id"], cwe))
+
+        node_list = list(nodes.keys())
+        n = len(node_list)
+        angle = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        pos = {node_list[i]: (np.cos(angle[i]), np.sin(angle[i])) for i in range(n)}
+
+        edge_x, edge_y = [], []
+        for a, b in edges:
+            if a in pos and b in pos:
+                edge_x += [pos[a][0], pos[b][0], None]
+                edge_y += [pos[a][1], pos[b][1], None]
+
+        color_map = {"cve": "#2FE2D0", "vendor": "#F5A524", "cwe": "#FF4D5E"}
+        node_x = [pos[k][0] for k in node_list]
+        node_y = [pos[k][1] for k in node_list]
+        node_color = [color_map[nodes[k]] for k in node_list]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(color="#1E2B3A", width=1), hoverinfo="none"))
+        fig.add_trace(go.Scatter(
+            x=node_x, y=node_y, mode="markers+text", text=node_list, textposition="top center",
+            marker=dict(size=16, color=node_color, line=dict(width=1, color="#0F1620")),
+            textfont=dict(size=10, color="#DCE6EE"),
+        ))
+        fig.update_layout(template=PLOTLY_TEMPLATE, showlegend=False, height=520,
+                           xaxis=dict(visible=False), yaxis=dict(visible=False))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("🟢 CVE   🟠 Vendor/Product   🔴 CWE weakness")
+
+# ---- REPORTS ------------------------------------------------------------
+with tab_reports:
+    st.markdown('<p class="section-label">// Bookmarked Investigations</p>', unsafe_allow_html=True)
+    bms = list(st.session_state.bookmarks.values())
+    if not bms:
+        st.info("No bookmarks yet — bookmark CVEs from the Search & Compare tab.")
+    else:
+        df = pd.DataFrame(bms)[["id", "severity", "cvss", "published", "description"]]
+        df.columns = ["CVE", "Severity", "CVSS", "Published", "Description"]
+        st.dataframe(df, use_container_width=True)
+
+        st.markdown('<p class="section-label">// Mitigation & Patch Recommendations</p>', unsafe_allow_html=True)
+        for rec in bms:
+            patch_refs = [r["url"] for r in rec.get("references", []) if "Patch" in r.get("tags", []) or "Vendor Advisory" in r.get("tags", [])]
+            st.markdown(f"**{rec['id']}** {severity_chip_html(rec['severity'])}", unsafe_allow_html=True)
+            if patch_refs:
+                for u in patch_refs[:3]:
+                    st.markdown(f"- [{u}]({u})")
+            else:
+                st.caption("No vendor patch link indexed by NVD — check the vendor's own advisory page.")
+
+        col1, col2 = st.columns(2)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        col1.download_button("⬇️ Export CSV", csv_bytes, file_name="signal_bookmarks.csv", mime="text/csv", use_container_width=True)
+
+        def build_pdf(records):
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.cell(0, 10, "SIGNAL — Investigation Report", ln=True)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.cell(0, 8, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True)
+            pdf.ln(4)
+            for rec in records:
+                pdf.set_font("Helvetica", "B", 12)
+                pdf.multi_cell(0, 7, f"{rec['id']}  [{rec['severity']}]  CVSS {rec['cvss'] or 'N/A'}")
+                pdf.set_font("Helvetica", "", 10)
+                desc = rec["description"].encode("latin-1", "replace").decode("latin-1")
+                pdf.multi_cell(0, 6, desc)
+                pdf.ln(3)
+            return bytes(pdf.output(dest="S"))
+
+        pdf_bytes = build_pdf(bms)
+        col2.download_button("⬇️ Export PDF",pdf_bytes, file_name="signal_report.pdf", mime="application/pdf", use_container_width=True)
