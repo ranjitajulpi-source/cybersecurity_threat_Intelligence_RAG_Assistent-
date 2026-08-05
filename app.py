@@ -763,22 +763,35 @@ with tab_reports:
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         col1.download_button("⬇️ Export CSV", csv_bytes, file_name="signal_bookmarks.csv", mime="text/csv", use_container_width=True)
 
+        def pdf_safe(text: str) -> str:
+            # FPDF's core fonts (Helvetica etc.) only support latin-1. Strip/replace
+            # anything outside that range (em dashes, curly quotes, emoji, etc.)
+            # so the PDF export never crashes on live CVE description text.
+            if text is None:
+                return ""
+            replacements = {
+                "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+                "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u2022": "-",
+            }
+            for bad, good in replacements.items():
+                text = text.replace(bad, good)
+            return text.encode("latin-1", "replace").decode("latin-1")
+
         def build_pdf(records):
             pdf = FPDF()
             pdf.add_page()
             pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, "SIGNAL — Investigation Report", ln=True)
+            pdf.cell(0, 10, pdf_safe("SIGNAL - Investigation Report"), ln=True)
             pdf.set_font("Helvetica", "", 10)
-            pdf.cell(0, 8, f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True)
+            pdf.cell(0, 8, pdf_safe(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}"), ln=True)
             pdf.ln(4)
             for rec in records:
                 pdf.set_font("Helvetica", "B", 12)
-                pdf.multi_cell(0, 7, f"{rec['id']}  [{rec['severity']}]  CVSS {rec['cvss'] or 'N/A'}")
+                pdf.multi_cell(0, 7, pdf_safe(f"{rec['id']}  [{rec['severity']}]  CVSS {rec['cvss'] or 'N/A'}"))
                 pdf.set_font("Helvetica", "", 10)
-                desc = rec["description"].encode("latin-1", "replace").decode("latin-1")
-                pdf.multi_cell(0, 6, desc)
+                pdf.multi_cell(0, 6, pdf_safe(rec["description"]))
                 pdf.ln(3)
             return bytes(pdf.output(dest="S"))
 
         pdf_bytes = build_pdf(bms)
-        col2.download_button("⬇️ Export PDF",pdf_bytes, file_name="signal_report.pdf", mime="application/pdf", use_container_width=True)
+        col2.download_button("⬇️ Export PDF", pdf_bytes, file_name="signal_report.pdf", mime="application/pdf", use_container_width=True)
